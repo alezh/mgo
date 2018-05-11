@@ -44,7 +44,7 @@ type mongoServer struct {
 	Addr          string
 	ResolvedAddr  string
 	tcpaddr       *net.TCPAddr
-	unusedSockets []*mongoSocket
+	unusedSockets []*timedMongoSocket
 	liveSockets   []*mongoSocket
 	closed        bool
 	abended       bool
@@ -55,6 +55,8 @@ type mongoServer struct {
 	pingCount     uint32
 	pingWindow    [6]time.Duration
 	info          *mongoServerInfo
+	minPoolSize   int
+	maxIdleTimeMS int
 }
 
 type dialer struct {
@@ -76,7 +78,7 @@ type mongoServerInfo struct {
 
 var defaultServerInfo mongoServerInfo
 
-func newServer(addr string, tcpaddr *net.TCPAddr, sync chan bool, dial dialer) *mongoServer {
+func newServer(addr string, tcpaddr *net.TCPAddr, sync chan bool, dial dialer, minPoolSize int, maxIdleTimeMS int) *mongoServer {
 	server := &mongoServer{
 		Addr:         addr,
 		ResolvedAddr: tcpaddr.String(),
@@ -85,8 +87,13 @@ func newServer(addr string, tcpaddr *net.TCPAddr, sync chan bool, dial dialer) *
 		dial:         dial,
 		info:         &defaultServerInfo,
 		pingValue:    time.Hour, // Push it back before an actual ping.
+		minPoolSize:  minPoolSize,
+		maxIdleTimeMS: maxIdleTimeMS,
 	}
 	go server.pinger(true)
+	if maxIdleTimeMS != 0 {
+		go server.releaser()
+	}
 	return server
 }
 
@@ -115,7 +122,7 @@ func (server *mongoServer) AcquireSocket(poolLimit int, timeout time.Duration) (
 			return nil, false, errPoolLimit
 		}
 		if n > 0 {
-			socket = server.unusedSockets[n-1]
+			socket = server.unusedSockets[n-1].soc
 			server.unusedSockets[n-1] = nil // Help GC.
 			server.unusedSockets = server.unusedSockets[:n-1]
 			info := server.info
@@ -208,7 +215,11 @@ func (server *mongoServer) Close() {
 func (server *mongoServer) RecycleSocket(socket *mongoSocket) {
 	server.Lock()
 	if !server.closed {
-		server.unusedSockets = append(server.unusedSockets, socket)
+		now := time.Now()
+		server.unusedSockets = append(server.unusedSockets, &timedMongoSocket{
+			lastTimeUsed:&now,
+			soc:socket,
+		})
 	}
 	server.Unlock()
 }
@@ -216,6 +227,19 @@ func (server *mongoServer) RecycleSocket(socket *mongoSocket) {
 func removeSocket(sockets []*mongoSocket, socket *mongoSocket) []*mongoSocket {
 	for i, s := range sockets {
 		if s == socket {
+			copy(sockets[i:], sockets[i+1:])
+			n := len(sockets) - 1
+			sockets[n] = nil
+			sockets = sockets[:n]
+			break
+		}
+	}
+	return sockets
+}
+
+func removeTimedSocket(sockets []*timedMongoSocket, socket *mongoSocket) []*timedMongoSocket {
+	for i, s := range sockets {
+		if s.soc == socket {
 			copy(sockets[i:], sockets[i+1:])
 			n := len(sockets) - 1
 			sockets[n] = nil
@@ -236,7 +260,7 @@ func (server *mongoServer) AbendSocket(socket *mongoSocket) {
 		return
 	}
 	server.liveSockets = removeSocket(server.liveSockets, socket)
-	server.unusedSockets = removeSocket(server.unusedSockets, socket)
+	server.unusedSockets = removeTimedSocket(server.unusedSockets, socket)
 	server.Unlock()
 	// Maybe just a timeout, but suggest a cluster sync up just in case.
 	select {
@@ -329,6 +353,49 @@ func (server *mongoServer) pinger(loop bool) {
 		}
 		if !loop {
 			return
+		}
+	}
+}
+
+func (server *mongoServer) releaser() {
+	for {
+
+		time.Sleep(1 * time.Minute)
+		if server.closed {
+			return
+		}
+		server.RLock()
+		if len(server.unusedSockets) < server.minPoolSize {
+			server.RUnlock()
+			continue
+		}
+		tmpSlice := make([]*timedMongoSocket, 0, len(server.unusedSockets) - server.minPoolSize)
+		for _, s := range server.unusedSockets {
+			if len(tmpSlice) == cap(tmpSlice) {
+				break
+			}
+			if time.Since(*(s.lastTimeUsed)) > time.Duration(server.maxIdleTimeMS) * time.Millisecond {
+				tmpSlice = append(tmpSlice, s)
+			}
+		}
+		server.RUnlock()
+
+		if len(tmpSlice) > 0 {
+			server.Lock()
+			for _, s := range tmpSlice {
+				for i, unused := range server.unusedSockets {
+					if s.soc == unused.soc {
+						copy(server.unusedSockets[i:], server.unusedSockets[i+1:])
+						n := len(server.unusedSockets) - 1
+						server.unusedSockets[n] = nil
+						server.unusedSockets = server.unusedSockets[:n]
+						stats.conn(-1, server.info.Master)
+						s.soc.Close()
+						break
+					}
+				}
+			}
+			server.Unlock()
 		}
 	}
 }
